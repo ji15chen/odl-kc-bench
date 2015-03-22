@@ -45,6 +45,7 @@ struct myargs my_options[] = {
     {"connect-group-size",  'I', "number of switches in a connection delay group", MYARGS_INTEGER, {.integer = 1}},
     {"learn-dst-macs",  'L', "send gratuitious ARP replies to learn destination macs before testing", MYARGS_FLAG, {.flag = 1}},
     {"dpid-offset",  'o', "switch DPID offset", MYARGS_INTEGER, {.integer = 1}},
+    {"version", 'V', "OpenFlow Version", MYARGS_INTEGER, {.integer = 1}},
     {0, 0, 0, 0}
 };
 
@@ -74,9 +75,13 @@ double run_test(int n_fakeswitches, struct fakeswitch * fakeswitches, int mstest
             fakeswitch_set_pollfd(&fakeswitches[i], &pollfds[i]);
 
         poll(pollfds, n_fakeswitches, 1000);      // block until something is ready or 100ms passes
-
         for(i = 0; i< n_fakeswitches; i++)
+        {
+            if(fakeswitches[i].version == OFP_VERSION)
             fakeswitch_handle_io(&fakeswitches[i], &pollfds[i]);
+            else
+            ofp131_fakeswitch_handle_io(&fakeswitches[i], &pollfds[i]);
+        }
     }
     tNow = now.tv_sec;
     tmNow = localtime(&tNow);
@@ -235,7 +240,8 @@ int count_bits(int n)
 
 
 
-#define PROG_TITLE "USAGE: cbench [option]  # by Rob Sherwood 2010"
+#define PROG_TITLE "USAGE: cbench [option]  # by Rob Sherwood 2010 & Team KulCloud 2014"
+#define OFP131_VERSION 4
 
 int main(int argc, char * argv[])
 {
@@ -256,6 +262,7 @@ int main(int argc, char * argv[])
     int     connect_group_size = myargs_get_default_integer(my_options, "connect-group-size");
     int     learn_dst_macs = myargs_get_default_flag(my_options, "learn-dst-macs");
     int     dpid_offset = myargs_get_default_integer(my_options, "dpid-offset");
+    int     version = myargs_get_default_integer(my_options, "version");
     int     mode = MODE_LATENCY;
     int     i,j;
 
@@ -326,6 +333,15 @@ int main(int argc, char * argv[])
             case 'o':
                 dpid_offset = atoi(optarg);
                 break;
+            case 'V':
+                version = atoi(optarg);
+                if(version != 1 && version != 4)
+                {
+                    fprintf(stdout,"Version %d is not applicable\n",version);
+                    exit(1);
+                }
+                break;
+
             default: 
                 myargs_usage(my_options, PROG_TITLE, "help message", NULL, 1);
         }
@@ -345,7 +361,8 @@ int main(int argc, char * argv[])
                 "   starting test with %d ms delay after features_reply\n"
                 "   ignoring first %d \"warmup\" and last %d \"cooldown\" loops\n"
                 "   connection delay of %dms per %d switch(es)\n"
-                "   debugging info is %s\n",
+                "   debugging info is %s\n"
+                "   running openflow version %u\n",
                 mode == MODE_THROUGHPUT? "'throughput'": "'latency'",
                 controller_hostname,
                 controller_port,
@@ -359,7 +376,8 @@ int main(int argc, char * argv[])
                 delay,
                 warmup,cooldown,
                 connect_delay,connect_group_size,
-                debug == 1 ? "on" : "off");
+                debug == 1 ? "on" : "off",
+                version);
     /* done parsing args */
     fakeswitches = malloc(n_fakeswitches * sizeof(struct fakeswitch));
     assert(fakeswitches);
@@ -388,7 +406,8 @@ int main(int argc, char * argv[])
         if(debug)
             fprintf(stderr,"Initializing switch %d ... ", i+1);
         fflush(stderr);
-        fakeswitch_init(&fakeswitches[i],dpid_offset+i,sock,BUFLEN, debug, delay, mode, total_mac_addresses, learn_dst_macs);
+        fakeswitch_init(&fakeswitches[i],dpid_offset+i,sock,BUFLEN, debug,
+                delay, mode, total_mac_addresses, learn_dst_macs, version);
         if(debug)
             fprintf(stderr," :: done.\n");
         fflush(stderr);
@@ -425,6 +444,7 @@ int main(int argc, char * argv[])
                 i+1,
                 counted_tests,
                 min, max, avg, std_dev);
+ //       scanf("%d",sum);
     }
 
     return 0;

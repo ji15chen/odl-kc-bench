@@ -1,4 +1,5 @@
 git log | grep Author: | sort  | uniq -c | sort -rn
+        Author: Nikhil Malik <nikhil@kulcloud.net>
      91 Author: Rob Sherwood <rob.sherwood@stanford.edu>
      20 Author: KK Yap <ykk@kkpc.Stanford.EDU>
      10 Author: Nadi Sarrar <nadi@net.t-labs.tu-berlin.de>

@@ -14,6 +14,7 @@ enum test_mode
 
 enum handshake_status {
     START = 0,
+    SEND_PORT_DESC =1,
     LEARN_DSTMAC = 2,
     READY_TO_SEND = 99,
     WAITING = 101
@@ -38,7 +39,9 @@ struct fakeswitch
     int total_mac_addresses;
     int current_mac_address;
     int learn_dstmac;
+    int send_port_desc;
     int current_buffer_id;
+    int version;
 };
 
 /*** Initialize an already allocated fakeswitch
@@ -54,7 +57,9 @@ struct fakeswitch
  * @param total_mac_addresses      The total number of unique mac addresses
  *                                 to use for packet ins from this switch
  */
-void fakeswitch_init(struct fakeswitch *fs, int dpid, int sock, int bufsize, int debug, int delay, enum test_mode mode, int total_mac_addresses, int learn_dstmac);
+void fakeswitch_init(struct fakeswitch *fs, int dpid, int sock, int bufsize,
+        int debug, int delay, enum test_mode mode, int total_mac_addresses,
+        int learn_dstmac, int version);
 
 
 /*** Set the desired flags for poll()
@@ -74,7 +79,7 @@ void fakeswitch_set_pollfd(struct fakeswitch *fs, struct pollfd *pfd);
  * @param pfd   Pointer to an allocated poll structure
  */
 void fakeswitch_handle_io(struct fakeswitch *fs, const struct pollfd *pfd);
-
+void ofp131_fakeswitch_handle_io(struct fakeswitch *fs, const struct pollfd *pfd);
 /**** Get and reset count 
  * @param fs    Pointer to initialized fakeswitch
  * @return      Number of flow_mod responses since last call

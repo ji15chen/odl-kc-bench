@@ -5,20 +5,25 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <openflow/openflow.h>
 
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
 
-#include <net/ethernet.h>
 
-#include <netinet/in.h>
 
 #include "config.h"
 #include "cbench.h"
 #include "fakeswitch.h"
 
+#include <openflow/openflow.h>
+
+#pragma pack(1)
+#include <net/ethernet.h>
+#include <netinet/ip.h>
+#include <netinet/in.h>
+#include "openflow131.h"
+#pragma pack()
 static int debug_msg(struct fakeswitch * fs, char * msg, ...);
 static int make_features_reply(int switch_id, int xid, char * buf, int buflen);
 static int make_stats_desc_reply(struct ofp_stats_request * req, char * buf, int buflen);
@@ -26,6 +31,7 @@ static int parse_set_config(struct ofp_header * msg);
 static int make_config_reply( int xid, char * buf, int buflen);
 static int make_vendor_reply(int xid, char * buf, int buflen);
 static int make_packet_in(int switch_id, int xid, int buffer_id, char * buf, int buflen, int mac_address);
+static int ofp131_make_packet_in(int switch_id, int xid, int buffer_id, char * buf, int buflen, int mac_address);
 static int packet_out_is_lldp(struct ofp_packet_out * po);
 static void fakeswitch_handle_write(struct fakeswitch *fs);
 static void fakeswitch_learn_dstmac(struct fakeswitch *fs);
@@ -51,7 +57,9 @@ static inline uint64_t ntohll(uint64_t n)
     return htonl(1) == 1 ? n : ((uint64_t) ntohl(n) << 32) | ntohl(n >> 32);
 }
 
-void fakeswitch_init(struct fakeswitch *fs, int dpid, int sock, int bufsize, int debug, int delay, enum test_mode mode, int total_mac_addresses, int learn_dstmac)
+void fakeswitch_init(struct fakeswitch *fs, int dpid, int sock, int bufsize,
+        int debug, int delay, enum test_mode mode, int total_mac_addresses,
+        int learn_dstmac, int version)
 {
     char buf[BUFLEN];
     struct ofp_header ofph;
@@ -62,7 +70,10 @@ void fakeswitch_init(struct fakeswitch *fs, int dpid, int sock, int bufsize, int
     fs->outbuf = msgbuf_new(bufsize);
     fs->probe_state = 0;
     fs->mode = mode;
+    if(version == OFP_VERSION)
     fs->probe_size = make_packet_in(fs->id, 0, 0, buf, BUFLEN, fs->current_mac_address++);
+    else
+    fs->probe_size = ofp131_make_packet_in(fs->id, 0, 0, buf, BUFLEN, fs->current_mac_address++);
     fs->count = 0;
     fs->switch_status = START;
     fs->delay = delay;
@@ -71,8 +82,8 @@ void fakeswitch_init(struct fakeswitch *fs, int dpid, int sock, int bufsize, int
     fs->xid = 1;
     fs->learn_dstmac = learn_dstmac;
     fs->current_buffer_id = 1;
-  
-    ofph.version = OFP_VERSION;
+    fs->version = version;
+    ofph.version = fs->version;
     ofph.type = OFPT_HELLO;
     ofph.length = htons(sizeof(ofph));
     ofph.xid   = htonl(1);
@@ -139,6 +150,68 @@ void fakeswitch_learn_dstmac(struct fakeswitch *fs)
 }
 
 
+
+void ofp131_fakeswitch_learn_dstmac(struct fakeswitch *fs)
+{
+    // thanks wireshark
+    char gratuitous_arp_reply [] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x0c, 
+        0x29, 0x1a, 0x29, 0x1a, 0x08, 0x06, 0x00, 0x01, 
+        0x08, 0x00, 0x06, 0x04, 0x00, 0x02, 0x00, 0x0c, 
+        0x29, 0x1a, 0x29, 0x1a, 0x7f, 0x00, 0x00, 0x01, 
+        0x00, 0x0c, 0x29, 0x1a, 0x29, 0x1a, 0x7f, 0x00, 
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    char mac_address_to_learn[] = { 0x80, 0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x01 };
+    char ip_address_to_learn[] = { 192, 168 , 1, 40 };
+
+    char buf [512];
+    int len = sizeof( struct ofp131_packet_in ) + sizeof(gratuitous_arp_reply);
+    struct ofp131_packet_in *pkt_in;
+    struct ether_header * eth;
+    void * arp_reply;
+
+    memset(buf, 0, sizeof(buf));
+    pkt_in = ( struct ofp_packet_in *) buf;
+
+    pkt_in->header.version = OFP131_VERSION;
+    pkt_in->header.type = OFPT_PACKET_IN;
+    pkt_in->header.length = htons(len);
+    pkt_in->header.xid = htonl(fs->xid++);
+    
+    pkt_in->buffer_id = -1;
+    pkt_in->table_id = 0;
+    pkt_in->cookie = 0;
+    pkt_in->match.type = htons(1); // OFPMT_OXM
+    pkt_in->match.length = htons(8); // OFPMT_OXM
+    
+
+    memcpy(pkt_in + 1, gratuitous_arp_reply, sizeof(gratuitous_arp_reply));
+
+    mac_address_to_learn[5] = fs->id;
+    ip_address_to_learn[2] = fs->id;
+
+    eth = (struct ether_header * ) (pkt_in + 1);
+    memcpy (eth->ether_shost, mac_address_to_learn, 6);
+
+    arp_reply =  ((void *)  eth) + sizeof (struct ether_header);
+    memcpy ( arp_reply + 8, mac_address_to_learn, 6);
+    memcpy ( arp_reply + 14, ip_address_to_learn, 4);
+    memcpy ( arp_reply + 18, mac_address_to_learn, 6);
+    memcpy ( arp_reply + 24, ip_address_to_learn, 4);
+
+    msgbuf_push(fs->outbuf,(char * ) pkt_in, len);
+    debug_msg(fs, " sent gratuitous ARP reply to learn about mac address: version %d length %d type %d eth: %x arp: %x ", pkt_in->header.version, len, buf[1], eth, arp_reply);
+}
+
+
+/***********************************************************************/
+
+
+
 /***********************************************************************/
 
 void fakeswitch_set_pollfd(struct fakeswitch *fs, struct pollfd *pfd)
@@ -181,19 +254,19 @@ static int parse_set_config(struct ofp_header * msg) {
 	sc = (struct ofp_switch_config *) msg;
 	memcpy(&Switch_config, sc, sizeof(struct ofp_switch_config));
 
-	return 0;
+    return 0;
 }
 
 
 /***********************************************************************/
 static int make_config_reply( int xid, char * buf, int buflen) {
-	int len = sizeof(struct ofp_switch_config);
-	assert(buflen >= len);
-	Switch_config.header.type = OFPT_GET_CONFIG_REPLY;
-	Switch_config.header.xid = xid;
-	memcpy(buf, &Switch_config, len);
+    int len = sizeof(struct ofp_switch_config);
+    assert(buflen >= len);
+    Switch_config.header.type = OFPT_GET_CONFIG_REPLY;
+    Switch_config.header.xid = xid;
+    memcpy(buf, &Switch_config, len);
 
-	return len;
+    return len;
 }
 
 /***********************************************************************/
@@ -228,6 +301,38 @@ static int              make_features_reply(int id, int xid, char * buf, int buf
     features->datapath_id = htonll(id);
     return sizeof(fake);
 }
+
+static int  ofp131_make_features_reply(int id, int xid, char * buf, int buflen)
+{
+    struct ofp131_switch_features * features;
+    features = (struct ofp131_switch_features *) buf;
+    memset(features, 0, sizeof(struct ofp131_switch_features));
+    features->header.version = OFP131_VERSION;
+    features->header.xid = xid;
+    features->header.length = htons(sizeof(struct ofp131_switch_features));
+    features->header.type = OFPT_FEATURES_REPLY;
+    features->datapath_id = htonll(id);
+    features->n_buffers  = htonll(1);
+    features->capabilities  = 0;
+    return sizeof(struct ofp131_switch_features);
+}
+/***********************************************************************/
+static int      make_stats_reply(struct ofp_stats_request * req, 
+        int reply_type, char * buf, int buflen) {
+
+    struct ofp_stats_reply * reply;
+    int len = sizeof(struct ofp_stats_reply);
+    assert(BUFLEN > len);
+
+    reply = (struct ofp_stats_reply *) buf;
+    reply->header.type = OFPT_STATS_REPLY;
+    reply->header.length = htons(len);
+    reply->type = ntohs(reply_type);
+    reply->flags = 0;
+
+    return len;
+}
+
 /***********************************************************************/
 static int      make_stats_desc_reply(struct ofp_stats_request * req, 
         char * buf, int buflen) {
@@ -248,6 +353,7 @@ static int      make_stats_desc_reply(struct ofp_stats_request * req,
     reply = (struct ofp_stats_reply *) buf;
     reply->header.type = OFPT_STATS_REPLY;
     reply->header.length = htons(len);
+    reply->type = ntohs(OFPST_DESC);
     reply->flags = 0;
     memcpy(reply->body, &cbench_desc, sizeof(cbench_desc));
 
@@ -290,6 +396,61 @@ static int packet_out_is_lldp(struct ofp_packet_out * po){
 }
 
 /***********************************************************************/
+static int ofp131_make_packet_in(int switch_id, int xid, int buffer_id, char * buf, int buflen, int mac_address)
+{
+    struct ofp131_packet_in * pi;
+    struct ofp_oxm_header *oxm_ptr;
+    struct ether_header * eth;
+    unsigned int in_port = htonl(2);
+    const char fake[] = {
+        0x97,0x0a,0x00,0x52,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x01,0x01,0x00,0x40,0x00,0x01,
+        0x00,0x00,0x80,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x02,0x08,0x00,
+		0x45,0x00,0x00,0x32,0x00,0x00,0x00,0x00,0x40,0xff,0xf7,0x2c,
+		0xcc,0xa8,0x00,0x28,0xc0,0xa8,0x01,0x28,0x7a,0x18,0x58,
+        0x6b,0x11,0x08,0x97,0xf5,0x19,0xe2,0x65,0x7e,0x07,0xcc,0x31,0xc3,0x11,0xc7};
+
+    memcpy(buf, fake, sizeof(fake));
+    pi = (struct ofp131_packet_in *) buf;
+    pi->header.version = OFP131_VERSION;
+    pi->header.type = OFPT_PACKET_IN;
+    pi->header.xid = htonl(xid);
+    pi->header.length = htons(sizeof(fake));
+    pi->buffer_id = htonl(buffer_id);
+    pi->table_id = 0;
+    pi->cookie = 0;
+    pi->match.type = htons(1); // OFPMT_OXM
+    pi->match.length = htons(12); // (sizeof (oxm_match) + oxm_ptr->length)
+    oxm_ptr = (void *)(pi->match.oxm_fields);
+
+    oxm_ptr->length = 4;
+    oxm_ptr->oxm_class = OFPXMC_OPENFLOW_BASIC;
+    OFP_OXM_SHDR_FIELD(oxm_ptr,0); //OFPXMT_OFB_IN_PORT
+
+    HTON_OXM_HDR(oxm_ptr);
+
+    memcpy(oxm_ptr->data,&in_port,4);
+
+    
+    eth = (struct ether_header * ) ((char*)pi + sizeof(struct
+                ofp131_packet_in) +  8);
+    // copy into src mac addr; only 4 bytes, but should suffice to not confuse
+    // the controller; don't overwrite first byte
+    memcpy(&eth->ether_shost[1], &mac_address, sizeof(mac_address));
+    // mark this as coming from us, mostly for debug
+    eth->ether_dhost[5] = switch_id;
+    eth->ether_shost[5] = switch_id;
+    eth->ether_type = htons(0x0800);
+    return sizeof(fake);
+}
+
+
+
+/***********************************************************************/
 static int make_packet_in(int switch_id, int xid, int buffer_id, char * buf, int buflen, int mac_address)
 {
     struct ofp_packet_in * pi;
@@ -327,6 +488,59 @@ void fakeswitch_change_status_now (struct fakeswitch *fs, int new_status) {
     }
         
 }
+
+static int ofp131_make_multipart_reply(int mp_type, int switch_id, int xid,
+        char * buf, int buflen)
+{
+    struct ofp131_multipart_reply *mp_reply;
+    int length = 0;
+    const char fake[] =     // stolen from wireshark
+    {
+
+      0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x1a,0xc1,0x51,0xff,0xef,0x8a,0x00,0x00,0x76,0x65,0x74,0x68,
+      0x31,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x00,0xce,0x2f,0xa2,0x87,0xf6,0x70,0x00,0x00,0x76,0x65,0x74,0x68,
+      0x33,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0xca,0x8a,0x1e,0xf3,0x77,0xef,0x00,0x00,0x76,0x65,0x74,0x68,
+      0x35,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x00,0xfa,0xbc,0x77,0x8d,0x7e,0x0b,0x00,0x00,0x76,0x65,0x74,0x68,
+      0x37,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+    };
+
+
+    mp_reply = (struct ofp131_multipart_reply *) buf;
+    mp_reply->header.version = OFP131_VERSION;
+    mp_reply->header.xid = xid;
+    mp_reply->header.type = OFPT131_MULTIPART_REPLY;
+
+    mp_reply->type = htons(mp_type);
+    mp_reply->flags = 0;
+
+    switch(mp_type) {
+        case OFPMP_PORT_DESC:
+            mp_reply->header.length = htons(sizeof(struct ofp131_multipart_reply) +
+                sizeof(fake));
+            memcpy(mp_reply->body, fake, sizeof(fake));
+            length = sizeof(struct ofp131_multipart_reply) + sizeof(fake);
+            break;
+
+        default:
+            mp_reply->header.length = htons(sizeof(struct ofp131_multipart_reply));
+            length = sizeof(struct ofp131_multipart_reply);
+            break;
+
+    }
+    return length;
+}
+
 
 void fakeswitch_change_status(struct fakeswitch *fs, int new_status) {
     if( fs->delay == 0) {
@@ -403,18 +617,18 @@ void fakeswitch_handle_read(struct fakeswitch *fs)
             case OFPT_SET_CONFIG:
                 // pull msgs out of buffer
                 debug_msg(fs, "parsing set_config");
-		parse_set_config(ofph);
+                parse_set_config(ofph);
                 break;
             case OFPT_GET_CONFIG_REQUEST:
                 // pull msgs out of buffer
                 debug_msg(fs, "got get_config_request");
                 count = make_config_reply(ofph->xid, buf, BUFLEN);
                 msgbuf_push(fs->outbuf, buf, count);
-		if ((fs->mode == MODE_LATENCY)  && ( fs->probe_state == 1 )) {     
-		    fs->probe_state = 0;       // restart probe state b/c some 
-					       // controllers block on config
-                	debug_msg(fs, "reset probe state b/c of get_config_reply");
-		}
+                if ((fs->mode == MODE_LATENCY)  && ( fs->probe_state == 1 )) {     
+                    fs->probe_state = 0;       // restart probe state b/c some 
+                    // controllers block on config
+                    debug_msg(fs, "reset probe state b/c of get_config_reply");
+                }
                 debug_msg(fs, "sent get_config_reply");
                 break;
             case OFPT_VENDOR:
@@ -427,7 +641,7 @@ void fakeswitch_handle_read(struct fakeswitch *fs)
                 fs->probe_state=0;
                 break;
             case OFPT_HELLO:
-                debug_msg(fs, "got hello");
+                debug_msg(fs, "got hello version %d",ofph->version);
                 // we already sent our own HELLO; don't respond
                 break;
             case OFPT_ECHO_REQUEST:
@@ -457,7 +671,11 @@ void fakeswitch_handle_read(struct fakeswitch *fs)
                                        // controllers block on config
                                 debug_msg(fs, "reset probe state b/c of desc_stats_request");
                     }
-                } else {
+                } else if(ntohs(stats_req->type) == OFPST_FLOW) {
+                    count = make_stats_reply(stats_req, OFPST_FLOW, buf, BUFLEN);
+                    msgbuf_push(fs->outbuf, buf, count);
+                }
+                else {
                     debug_msg(fs, "Silently ignoring non-desc stats_request msg\n");
                 }
                 break;
@@ -528,6 +746,197 @@ void fakeswitch_handle_io(struct fakeswitch *fs, const struct pollfd *pfd)
         fakeswitch_handle_write(fs);
 }
 /************************************************************************/
+
+/***********************************************************************/
+void ofp131_fakeswitch_handle_read(struct fakeswitch *fs)
+{
+    int count;
+    struct ofp_header * ofph;
+    struct ofp_header echo;
+    char buf[BUFLEN];
+    enum ofp131_multipart_types mp_req_type;
+    count = msgbuf_read(fs->inbuf, fs->sock);   // read any queued data
+    if (count <= 0)
+    {
+        fprintf(stderr, "controller msgbuf_read() = %d:  ", count);
+        if(count < 0)
+            perror("msgbuf_read");
+        else
+            fprintf(stderr, " closed connection ");
+        fprintf(stderr, "... exiting\n");
+        exit(1);
+    }
+    while((count= msgbuf_count_buffered(fs->inbuf)) >= sizeof(struct ofp_header ))
+    {
+        ofph = msgbuf_peek(fs->inbuf);
+        if(count < ntohs(ofph->length))
+            return;     // msg not all there yet
+        msgbuf_pull(fs->inbuf, NULL, ntohs(ofph->length));
+        switch(ofph->type)
+        {
+            struct ofp_flow_mod * fm;
+            struct ofp_packet_out *po;
+            struct ofp131_multipart_request * mp_req;
+            case OFPT131_PACKET_OUT:
+                po = (struct ofp_packet_out *) ofph;
+                if ( fs->switch_status == READY_TO_SEND && !packet_out_is_lldp(po)) { 
+                    // assume this is in response to what we sent
+                    fs->count++;        // got response to what we went
+                    fs->probe_state--;
+                }
+                break;
+            case OFPT131_FLOW_MOD:
+                fm = (struct ofp_flow_mod *) ofph;
+                if(fs->switch_status == READY_TO_SEND && (fm->command == htons(OFPFC_ADD) || 
+                        fm->command == htons(OFPFC_MODIFY_STRICT)))
+                {
+                    fs->count++;        // got response to what we went
+                    fs->probe_state--;
+                }
+                break;
+            case OFPT_FEATURES_REQUEST:
+                // pull msgs out of buffer
+                debug_msg(fs, "OF1.3 got feature_req");
+                // Send features reply
+                count = ofp131_make_features_reply(fs->id, ofph->xid, buf, BUFLEN);
+                msgbuf_push(fs->outbuf, buf, count);
+                debug_msg(fs, "OF1.3 sent feature_rsp, len %d",count);
+                fakeswitch_change_status(fs, SEND_PORT_DESC);
+                break;
+            case OFPT131_HELLO:
+                debug_msg(fs, "OF1.3 got hello, Version %d ",ofph->version);
+                // we already sent our own HELLO; don't respond
+                break;
+            case OFPT131_ECHO_REQUEST:
+                debug_msg(fs, "of1.3 got echo, sent echo_resp");
+                echo.version= OFP131_VERSION;
+                echo.length = htons(sizeof(echo));
+                echo.type   = OFPT_ECHO_REPLY;
+                echo.xid = ofph->xid;
+                msgbuf_push(fs->outbuf,(char *) &echo, sizeof(echo));
+                break;
+            case OFPT131_MULTIPART_REQUEST:
+                mp_req = (struct ofp_multipart_req *) ofph;
+                mp_req_type = ntohs(mp_req->type);
+                switch (mp_req_type)
+                {
+                    case OFPMP_PORT_DESC:
+                        debug_msg(fs, "OF1.3 got MP port desc req");
+                        count = ofp131_make_multipart_reply(mp_req_type,
+                                fs->id, ofph->xid, buf, BUFLEN);
+                        fs->send_port_desc = 1;
+                        msgbuf_push(fs->outbuf, buf, count);
+                        debug_msg(fs, "OF1.3 sent port description");
+                        break;
+                    case OFPMP_GROUP_FEATURES:
+                        debug_msg(fs, "OF1.3 got MP group feature req,"
+                                " ignored");
+                        break;
+                    case OFPMP_METER_FEATURES:
+                        debug_msg(fs, "OF1.3 got MP meter feature req,"
+                                " ignored");
+                        break;
+                    case OFPMP_TABLE_FEATURES:
+                        debug_msg(fs, "OF1.3 got MP table feature req,"
+                                " ignored");
+                        break;
+
+                    default: 
+                        count = ofp131_make_multipart_reply(mp_req_type,
+                                fs->id, ofph->xid, buf, BUFLEN);
+                        msgbuf_push(fs->outbuf, buf, count);
+                        break;
+                }
+                break;
+            case OFPT131_SET_CONFIG:
+                debug_msg(fs, "of1.3 got set config, ignored");
+                break;
+            case OFPT131_GROUP_MOD:
+                debug_msg(fs, "of1.3 got group mod, ignored");
+                break;
+            case OFPT131_METER_MOD:
+                debug_msg(fs, "of1.3 got meter mod, ignored");
+                break;
+            case OFPT131_ROLE_REQUEST:
+                debug_msg(fs, "of1.3 got role request, ignored");
+                break;
+
+            default: 
+                    fprintf(stderr, "Ignoring OpenFlow message type %d\n", ofph->type);
+                break;
+        };
+        if(fs->probe_state < 0)
+        {
+                debug_msg(fs, "WARN: Got more responses than probes!!: : %d",
+                            fs->probe_state);
+                fs->probe_state =0;
+        }
+    }
+}
+/***********************************************************************/
+static void ofp131_fakeswitch_handle_write(struct fakeswitch *fs)
+{
+    char buf[BUFLEN];
+    int count = 0;
+    int send_count = 0 ;
+    int throughput_buffer = BUFLEN;
+    int i;
+    if( fs->switch_status == READY_TO_SEND) 
+    {
+        if ((fs->mode == MODE_LATENCY)  && ( fs->probe_state == 0 ))      
+            send_count = 1;                 // just send one packet
+        else if ((fs->mode == MODE_THROUGHPUT) && 
+                (msgbuf_count_buffered(fs->outbuf) < throughput_buffer))  // keep buffer full
+            send_count = (throughput_buffer - msgbuf_count_buffered(fs->outbuf)) / fs->probe_size;
+        for (i = 0; i < send_count; i++)
+        {
+            // queue up packet
+            fs->probe_state++;
+            // TODO come back and remove this copy
+            count = ofp131_make_packet_in(fs->id, fs->xid++, fs->current_buffer_id, buf, BUFLEN, fs->current_mac_address);
+            fs->current_mac_address = ( fs->current_mac_address + 1 ) % fs->total_mac_addresses;
+            fs->current_buffer_id =  ( fs->current_buffer_id + 1 ) % NUM_BUFFER_IDS;
+            msgbuf_push(fs->outbuf, buf, count);
+            debug_msg(fs, "send message %d", i);
+        }
+    } else if( fs->switch_status == WAITING) 
+    {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        if (timercmp(&now, &fs->delay_start, > ))
+        {
+            fakeswitch_change_status_now(fs, fs->next_status);
+            debug_msg(fs, " delay is over: switching to state %d", fs->next_status);
+        }
+    } else if (  fs->switch_status == LEARN_DSTMAC) 
+    {
+        // we should learn the dst mac addresses
+        ofp131_fakeswitch_learn_dstmac(fs);
+        fakeswitch_change_status(fs, READY_TO_SEND);
+
+    } else if (  fs->switch_status == SEND_PORT_DESC) 
+    {
+        // we should wait for Multipart (Port desc message) from controller
+        if(fs->send_port_desc)
+        fakeswitch_change_status(fs, fs->learn_dstmac ? LEARN_DSTMAC : READY_TO_SEND);
+    }
+    // send any data if it's queued
+    if( msgbuf_count_buffered(fs->outbuf) > 0)
+        msgbuf_write(fs->outbuf, fs->sock, 0);
+}
+
+
+/***********************************************************************/
+void ofp131_fakeswitch_handle_io(struct fakeswitch *fs, const struct pollfd *pfd)
+{
+    if(pfd->revents & POLLIN)
+        ofp131_fakeswitch_handle_read(fs);
+    if(pfd->revents & POLLOUT)
+        ofp131_fakeswitch_handle_write(fs);
+}
+
+/************************************************************************/
+
 static int debug_msg(struct fakeswitch * fs, char * msg, ...)
 {
     va_list aq;
